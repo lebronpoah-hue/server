@@ -1,0 +1,337 @@
+/**
+ * STUDY fetch server.
+ *
+ * A small, self-contained HTTP service that fetches a web address and hands the
+ * page back, so the Study page can show pages a network filter would otherwise
+ * block. It is stronger than the Apps Script worker: it runs on a real host,
+ * sends browser-like headers and keeps cookies per visitor, so sites that need
+ * a session keep working.
+ *
+ * Run it anywhere that gives you a URL:
+ *
+ *   PORT=8080 node server.mjs
+ *
+ * Environment:
+ *   PORT         port to listen on (most hosts set this for you)
+ *   PROXY_TOKEN  optional shared secret; when set, every request must carry
+ *                ?token=<same value>
+ *
+ * Endpoints:
+ *   GET /health                     -> {"ok":true}
+ *   GET /?url=<address>             -> the address, rewritten
+ *   GET /?q=<words>&engine=<name>   -> search results, rewritten
+ */
+
+import http from "node:http";
+import { URL } from "node:url";
+
+const PORT = Number(process.env.PORT || 8080);
+const TOKEN = process.env.PROXY_TOKEN || "";
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+const ENGINES = {
+  bing: { label: "Bing", url: "https://www.bing.com/search?q=" },
+  duckduckgo: { label: "DuckDuckGo", url: "https://duckduckgo.com/?q=" },
+  google: { label: "Google", url: "https://www.google.com/search?q=" },
+};
+const FALLBACK_ENGINE = "bing";
+
+/** Cookies are kept per visitor, so sites that need a session keep working. */
+const cookieJar = new Map();
+const MAX_JAR = 500;
+
+
+function browserHeaders(extra) {
+  return Object.assign(
+    {
+      "user-agent": UA,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "accept-language": "en-US,en;q=0.9",
+      "accept-encoding": "identity",
+      "upgrade-insecure-requests": "1",
+      "sec-fetch-dest": "document",
+      "sec-fetch-mode": "navigate",
+      "sec-fetch-site": "none",
+      "sec-fetch-user": "?1",
+      "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+    },
+    extra || {},
+  );
+}
+
+async function get(url, visitor) {
+  const jar = cookieJar.get(visitor);
+  const response = await fetch(url, {
+    redirect: "follow",
+    headers: browserHeaders(jar ? { cookie: jar } : {}),
+  });
+
+  let setCookie = [];
+  if (typeof response.headers.getSetCookie === "function") {
+    setCookie = response.headers.getSetCookie();
+  }
+  if (setCookie.length) {
+    const pair = setCookie.map((cookie) => cookie.split(";")[0]).join("; ");
+    if (cookieJar.size > MAX_JAR) cookieJar.clear();
+    cookieJar.set(visitor, jar ? jar + "; " + pair : pair);
+  }
+
+  const body = Buffer.from(await response.arrayBuffer()).toString("latin1");
+  return {
+    status: response.status,
+    contentType: response.headers.get("content-type") || "text/html; charset=utf-8",
+    body,
+  };
+}
+
+const PROXIED_ATTRS = new Set(["href", "src", "action", "poster", "data-src", "formaction", "data-href"]);
+const PROXIED_TAGS = new Set(["a", "area", "iframe", "frame", "form"]);
+
+function skippable(value) {
+  const trimmed = String(value).trim();
+  if (!trimmed) return true;
+  return /^(#|javascript:|mailto:|tel:|data:|about:|blob:)/i.test(trimmed);
+}
+
+function absolute(base, value) {
+  try {
+    return new URL(value, base).toString();
+  } catch (error) {
+    return value;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function proxyHref(target, relay, token) {
+  const suffix = token ? "&token=" + encodeURIComponent(token) : "";
+  return relay + "?url=" + encodeURIComponent(target) + suffix;
+}
+
+function rewriteCss(css, base) {
+  return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, function (match, quote, value) {
+    return skippable(value) ? match : "url(" + absolute(base, value) + ")";
+  });
+}
+
+function rewritePage(html, base, relay, token) {
+  let out = html.replace(/<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi, "");
+
+  out = out.replace(/<([a-zA-Z][\w:-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/g, function (match, tag, attrs) {
+    const proxied = PROXIED_TAGS.has(tag.toLowerCase());
+    const rewritten = attrs.replace(
+      /(\s)([a-zA-Z_:][\w:.-]*)\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/g,
+      function (whole, space, attribute, raw, doubleQuoted, singleQuoted, bare) {
+        const key = attribute.toLowerCase();
+        const value = doubleQuoted !== undefined ? doubleQuoted : singleQuoted !== undefined ? singleQuoted : bare;
+        if (key === "srcset" || key === "data-srcset") {
+          const parts = value.split(",").map(function (part) {
+            const pieces = part.trim().split(/\s+/);
+            if (!pieces[0] || skippable(pieces[0])) return part.trim();
+            pieces[0] = absolute(base, pieces[0]);
+            return pieces.join(" ");
+          });
+          return space + attribute + '="' + parts.join(", ") + '"';
+        }
+        if (!PROXIED_ATTRS.has(key)) return whole;
+        if (skippable(value)) return whole;
+        const target = absolute(base, value);
+        return space + attribute + '="' + (proxied ? proxyHref(target, relay, token) : target) + '"';
+      },
+    );
+    return "<" + tag + rewritten + ">";
+  });
+
+  out = rewriteCss(out, base);
+  return out.replace(/<\/body>/i, injectedScript(base, relay, token) + "</body>");
+}
+
+function injectedScript(base, relay, token) {
+  const source =
+    "(function(){" +
+    "var BASE=" + JSON.stringify(base) + ";" +
+    "var RELAY=" + JSON.stringify(relay) + ";" +
+    "var TOKEN=" + JSON.stringify(token || "") + ";" +
+    "function proxied(u){return RELAY+'?url='+encodeURIComponent(u)+(TOKEN?'&token='+encodeURIComponent(TOKEN):'');}" +
+    "function absolute(u){try{return new URL(u,BASE).toString();}catch(e){return u;}}" +
+    "document.addEventListener('click',function(e){" +
+    "var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;if(!a)return;" +
+    "var href=a.getAttribute('href');if(!href||/^(#|javascript:|mailto:|tel:)/i.test(href))return;" +
+    "var u=href.indexOf('url=')!==-1?decodeURIComponent(href.split('url=').pop().split('&')[0]):absolute(href);" +
+    "if(e.metaKey||e.ctrlKey||e.shiftKey||a.target==='_blank')return;" +
+    "e.preventDefault();location.href=proxied(u);" +
+    "},true);" +
+    "})();";
+  return (
+    '<script>(function(){var s=document.createElement("script");s.textContent=' +
+    JSON.stringify(source) +
+    ';document.head.appendChild(s);})();</script>'
+  );
+}
+
+function banner(note) {
+  return (
+    '<div style="padding:.75rem 1.25rem;background:#050505;color:#f5f5f7;' +
+    "font:500 .82rem/1.6 Inter,system-ui,sans-serif;border-bottom:1px solid rgba(255,255,255,.12);" +
+    'text-align:center">' +
+    note +
+    "</div>"
+  );
+}
+
+function withBanner(html, note) {
+  if (!note) return html;
+  const open = html.search(/<body[^>]*>/i);
+  if (open === -1) return banner(note) + html;
+  const close = html.indexOf(">", open) + 1;
+  return html.slice(0, close) + banner(note) + html.slice(close);
+}
+
+function noticePage(heading, detail) {
+  return (
+    '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1"><title>STUDY proxy</title><style>' +
+    "body{margin:0;min-height:100vh;display:grid;place-items:center;background:#050505;color:#f5f5f7;" +
+    "font-family:Inter,system-ui,sans-serif;text-align:center;padding:2rem}" +
+    "h1{font-size:1.75rem;font-weight:900;margin:0 0 1rem}" +
+    "p{max-width:34rem;margin:0 auto;opacity:.7;font-size:.9rem;line-height:1.7;overflow-wrap:anywhere}" +
+    "</style></head><body><div><h1>" +
+    escapeHtml(heading) +
+    "</h1><p>" +
+    escapeHtml(detail) +
+    "</p></div></body></html>"
+  );
+}
+
+async function tryEngine(url, relay, token, visitor) {
+  let page;
+  try {
+    page = await get(url, visitor);
+  } catch (error) {
+    return { ok: false, reason: String(error && error.message ? error.message : error) };
+  }
+  if (page.status >= 400) return { ok: false, reason: "HTTP " + page.status };
+  const blocked = /anomaly|captcha|unusual traffic|challenge-form|are you a robot|detected unusual|robot check/i.test(
+    page.body,
+  );
+  const hasResults = /class="b_algo"|result__a|class="result |id="links"|class="g"|results-link|<h3/i.test(page.body);
+  if (blocked || !hasResults) return { ok: false, reason: "a robot check instead of results" };
+  return { ok: true, body: rewritePage(page.body, url, relay, token) };
+}
+
+async function search(words, engine, relay, token, visitor) {
+  const chosen = ENGINES[engine] ? engine : FALLBACK_ENGINE;
+  const query = encodeURIComponent(String(words).trim());
+
+  const first = await tryEngine(ENGINES[chosen].url + query, relay, token, visitor);
+  if (first.ok) return first.body;
+
+  if (chosen === FALLBACK_ENGINE) {
+    return noticePage(
+      ENGINES[chosen].label + " did not answer the proxy",
+      "It returned " + first.reason + ". Try the same words again in a moment.",
+    );
+  }
+
+  const second = await tryEngine(ENGINES[FALLBACK_ENGINE].url + query, relay, token, visitor);
+  if (!second.ok) {
+    return noticePage(
+      "No engine answered the proxy",
+      "Both " + ENGINES[chosen].label + " and " + ENGINES[FALLBACK_ENGINE].label + " refused this search.",
+    );
+  }
+
+  const note =
+    "<strong>" +
+    ENGINES[chosen].label +
+    "</strong> asked the proxy for a human check, so these are <strong>" +
+    ENGINES[FALLBACK_ENGINE].label +
+    "</strong> results for &ldquo;" +
+    escapeHtml(words) +
+    "&rdquo;.";
+  return withBanner(second.body, note);
+}
+
+/**
+ * Where rewritten links point. Normally this server itself, but a caller may
+ * pass ?relay=<address> so links go back through that address instead - for
+ * example through the Apps Script worker in front of this server.
+ */
+function relayFrom(request, requested) {
+  if (requested && /^https?:\/\//i.test(requested)) return requested;
+  const host = request.headers["x-forwarded-host"] || request.headers.host || "localhost:" + PORT;
+  const proto = request.headers["x-forwarded-proto"] || "http";
+  return proto + "://" + host + "/";
+}
+
+const server = http.createServer(async function (request, response) {
+  const url = new URL(request.url, "http://localhost");
+  const params = url.searchParams;
+  const visitor = request.headers["x-forwarded-for"] || request.socket.remoteAddress || "unknown";
+
+  if (url.pathname === "/health") {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, tokenRequired: Boolean(TOKEN) }));
+    return;
+  }
+
+  if (TOKEN && params.get("token") !== TOKEN) {
+    response.writeHead(401, { "content-type": "text/html; charset=utf-8" });
+    response.end(noticePage("Not authorised", "This fetch server needs its token."));
+    return;
+  }
+
+  const send = function (body) {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+    response.end(body);
+  };
+
+  const relay = relayFrom(request, params.get("relay"));
+
+  try {
+    if (params.get("q")) {
+      send(await search(params.get("q"), params.get("engine"), relay, TOKEN, visitor));
+      return;
+    }
+
+    const target = params.get("url");
+    if (!target) {
+      send(
+        noticePage(
+          "STUDY fetch server is running",
+          "Ask for an address with ?url=https://example.com, or search with ?q=your+words&engine=bing.",
+        ),
+      );
+      return;
+    }
+
+    const page = await get(target, visitor);
+    if (page.status >= 400) {
+      send(noticePage("Site answered HTTP " + page.status, target));
+      return;
+    }
+    if (/html|xhtml/i.test(page.contentType)) {
+      send(rewritePage(page.body, target, relay, TOKEN));
+    } else if (/css/i.test(page.contentType)) {
+      send(rewriteCss(page.body, target));
+    } else {
+      response.writeHead(200, { "content-type": page.contentType });
+      response.end(Buffer.from(page.body, "latin1"));
+    }
+  } catch (error) {
+    send(noticePage("Could not open that address", String(error && error.message ? error.message : error)));
+  }
+});
+
+server.listen(PORT, function () {
+  process.stdout.write("STUDY fetch server listening on port " + PORT + "\n");
+});
